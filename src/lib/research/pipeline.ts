@@ -7,6 +7,7 @@ export type PipelineInput = {
   goal: string;
   decision: string;
   outputFormat: string;
+  outputLanguage?: "nl" | "en";
   constraints?: string;
 };
 
@@ -36,7 +37,6 @@ export type PipelineOutput = {
 
 export type TavilySearcher = (query: string) => Promise<Source[]>;
 
-// ===== Tavily constants =====
 const TAVILY_QUERY_MAX = 400;
 
 const AUTHORITY_DOMAINS = [
@@ -56,40 +56,31 @@ const AUTHORITY_DOMAINS = [
   "mit.edu",
 ];
 
-// Default export: prod pipeline expects a searcher factory (wired elsewhere)
 export async function runResearchPipeline(
   input: PipelineInput,
   deps: {
-    searcher: TavilySearcher; // injected (prod: Tavily; test: mock)
-    includeDebug?: boolean; // default false
+    searcher: TavilySearcher;
+    includeDebug?: boolean;
   }
 ): Promise<PipelineOutput> {
   const debugPasses: DebugPass[] = [];
 
-  // PASS 1: seed
   const seedQueries = buildSeedQueries(input);
   const seed = await runTavilyPass("seed", seedQueries, deps.searcher);
   debugPasses.push(seed.debug);
 
-  // PASS 2: expand
   const expandQueries = buildExpandQueries(input, seed.sources);
   const expand = await runTavilyPass("expand", expandQueries, deps.searcher);
   debugPasses.push(expand.debug);
 
-  // PASS 3: authority
   const authorityQueries = buildAuthorityQueries(input, [...seed.sources, ...expand.sources]);
   const authority = await runTavilyPass("authority", authorityQueries, deps.searcher);
   debugPasses.push(authority.debug);
 
-  // Merge + dedupe sources (by url)
   const mergedSources = dedupeSourcesByUrl([...seed.sources, ...expand.sources, ...authority.sources]);
 
-  // === Scoring + gating ===
-  // Koppel hier jouw bestaande scoring/gating in.
-  const { decisionStatus, confidence, confidenceRationale } = simpleGate(mergedSources);
+  const { decisionStatus, confidence, confidenceRationale } = simpleGate(mergedSources, input.outputLanguage);
 
-  // === OpenAI decision ===
-  // Koppel hier jouw bestaande OpenAI decision call in.
   const recommendationOrSafeDefault =
     decisionStatus === "EVIDENCE_SUFFICIENT"
       ? buildRecommendationFromEvidence(input, mergedSources)
@@ -148,7 +139,7 @@ function buildAuthorityQueries(input: PipelineInput, sourcesSoFar: Source[]): st
 }
 
 // ============================
-// Tavily pass runner (truncation + logs live here)
+// Tavily pass runner
 // ============================
 async function runTavilyPass(
   pass: "seed" | "expand" | "authority",
@@ -197,9 +188,12 @@ async function runTavilyPass(
 }
 
 // ============================
-// Gating (fallback) — vervang door jouw bestaande gating
+// Gating (fallback)
 // ============================
-function simpleGate(sources: Source[]): {
+function simpleGate(
+  sources: Source[],
+  lang: "nl" | "en" | undefined
+): {
   decisionStatus: DecisionStatus;
   confidence: number;
   confidenceRationale: string;
@@ -207,28 +201,48 @@ function simpleGate(sources: Source[]): {
   const uniqueDomains = new Set(sources.map((s) => safeDomain(s.url)).filter(Boolean)).size;
   const enough = sources.length >= 6 && uniqueDomains >= 4;
 
-  return enough
-    ? {
-        decisionStatus: "EVIDENCE_SUFFICIENT",
-        confidence: 0.78,
-        confidenceRationale: `Sufficient breadth: ${sources.length} sources across ${uniqueDomains} domains.`,
-      }
-    : {
-        decisionStatus: "INSUFFICIENT_EVIDENCE",
-        confidence: 0.32,
-        confidenceRationale: `Insufficient breadth: ${sources.length} sources across ${uniqueDomains} domains.`,
-      };
+  if (enough) {
+    return {
+      decisionStatus: "EVIDENCE_SUFFICIENT",
+      confidence: 0.78,
+      confidenceRationale:
+        lang === "en"
+          ? `Sufficient breadth: ${sources.length} sources across ${uniqueDomains} domains.`
+          : `Voldoende breedte: ${sources.length} bronnen over ${uniqueDomains} domeinen.`,
+    };
+  }
+
+  return {
+    decisionStatus: "INSUFFICIENT_EVIDENCE",
+    confidence: 0.32,
+    confidenceRationale:
+      lang === "en"
+        ? `Insufficient breadth: ${sources.length} sources across ${uniqueDomains} domains.`
+        : `Onvoldoende breedte: ${sources.length} bronnen over ${uniqueDomains} domeinen.`,
+  };
 }
 
 // ============================
-// Output builders
+// Output builders (LANG-AWARE)
 // ============================
 function buildRecommendationFromEvidence(input: PipelineInput, sources: Source[]): string {
+  const lang = input.outputLanguage ?? "nl";
   const top = sources.slice(0, 5).map((s) => `- ${s.title || s.url}`).join("\n");
+
+  if (lang === "en") {
+    return `Recommendation (based on collected evidence):\n\nGoal: ${input.goal}\nDecision: ${input.decision}\n\nTop sources:\n${top}`;
+  }
+
   return `Aanbeveling (op basis van gevonden evidence):\n\nDoel: ${input.goal}\nBeslissing: ${input.decision}\n\nTop bronnen:\n${top}`;
 }
 
 function buildSafeDefault(input: PipelineInput): string {
+  const lang = input.outputLanguage ?? "nl";
+
+  if (lang === "en") {
+    return `Insufficient evidence to make a robust recommendation.\n\nSafe default:\n- Define explicit decision criteria (must-haves / nice-to-haves).\n- Collect 3–5 additional primary/authoritative sources.\n- Re-run the research with a tighter scope.\n\nContext:\nGoal: ${input.goal}\nDecision: ${input.decision}`;
+  }
+
   return `Onvoldoende bewijs om een robuuste aanbeveling te doen.\n\nSafe default:\n- Formuleer expliciete besliscriteria (must-haves / nice-to-haves).\n- Verzamel 3–5 extra primaire/autoritatieve bronnen.\n- Herhaal het onderzoek met aangescherpte scope.\n\nContext:\nDoel: ${input.goal}\nBeslissing: ${input.decision}`;
 }
 
@@ -338,9 +352,6 @@ function extractKeywordsDeterministic(text: string, max: number): string[] {
 function logEvent(event: string, payload: Record<string, unknown>) {
   const isTest = typeof process !== "undefined" && !!process.env.VITEST;
   const logsEnabled = process.env.RESEARCH_LOGS !== "0";
-
   if (isTest || !logsEnabled) return;
-
   console.log(JSON.stringify({ event, ...payload }));
 }
-
